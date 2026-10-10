@@ -1,0 +1,3 @@
+[console_scripts]
+ableton-mcp = MCP_Server.server:main
+ableton-mcp-install-script = MCP_Server.remote_script_install:main
