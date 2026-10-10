@@ -19,6 +19,12 @@ where plan.json is a list of jobs:
      "points": [{"time": 32, "value": 0.45}, ...],      # absolute Arrangement beats
      "blocks": [32, 48, 64],                               # start beats of blocks to rewrite
      "fallback_source_slot": 2}                            # for blocks whose name matches no Session clip
+Several parameters in the same blocks go in one job as
+    "targets": [{"target": {...}, "points": [...]}, ...]
+instead of "target"/"points": rebuilding a block replaces the clip, so curves
+written in separate passes over the same block could overwrite each other.
+Give each curve explicit values for every rebuilt block (use "step" points
+to hold the baseline), since a curve holds its end values outside its points.
 """
 import json
 import os
@@ -72,12 +78,16 @@ def automate_blocks(job):
         _ok(call("create_clip", {"track_index": track, "clip_index": carrier, "length": block["length"]}), "create carrier")
         _ok(call("set_clip_name", {"track_index": track, "clip_index": carrier, "name": "__automation_carrier__"}), "name carrier")
         _ok(call("add_notes_to_clip", {"track_index": track, "clip_index": carrier, "notes": note_cache[source]}), "copy notes")
-        local_points = [dict(p, time=p["time"] - block_start) for p in job["points"]]
-        _ok(call("set_clip_automation", {
-            "track_index": track, "clip_view": "session", "clip_index": carrier,
-            "target": job["target"], "points": local_points,
-            "resolution": job.get("resolution", 0.25), "clear_existing": True,
-        }), "write envelope")
+        # A rebuilt block replaces the clip, so every curve that should live in
+        # it goes into the same carrier ("targets"), not into separate passes.
+        curves = job.get("targets") or [{"target": job["target"], "points": job["points"]}]
+        for curve in curves:
+            local_points = [dict(p, time=p["time"] - block_start) for p in curve["points"]]
+            _ok(call("set_clip_automation", {
+                "track_index": track, "clip_view": "session", "clip_index": carrier,
+                "target": curve["target"], "points": local_points,
+                "resolution": job.get("resolution", 0.25), "clear_existing": True,
+            }), "write envelope")
         _ok(call("duplicate_session_clip_to_arrangement", {
             "track_index": track, "clip_index": carrier, "destination_time": block_start,
         }), "duplicate carrier")
