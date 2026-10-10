@@ -139,14 +139,21 @@ class AbletonConnection:
             # Arrangement view commands
             "switch_to_arrangement_view", "set_current_song_time",
             "duplicate_session_clip_to_arrangement",
-            "create_locator"
+            "create_locator",
+            # Automation (clip envelopes)
+            "set_clip_automation", "clear_clip_automation",
+            "set_arrangement_automation", "clear_arrangement_automation",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
         # than the default modifying-command budget (e.g. importing/decoding a
         # large audio file). Give them a wider socket timeout so we don't time
         # out before the Remote Script's own queue does.
-        long_running_commands = {"create_audio_clip": 65.0}
+        long_running_commands = {
+            "create_audio_clip": 65.0,
+            "set_arrangement_automation": 65.0,
+            "clear_arrangement_automation": 35.0,
+        }
         
         try:
             logger.info(f"Sending command: {command_type} with params: {params}")
@@ -1303,6 +1310,297 @@ def duplicate_to_arrangement(
     except Exception as e:
         logger.error(f"Error duplicating clip to arrangement: {str(e)}")
         return f"Error duplicating clip to arrangement: {str(e)}"
+
+
+# ── Automation (clip envelopes) ───────────────────────────────────────────────
+#
+# Live's API only writes automation that lives inside clips. Track-level
+# Arrangement lanes are not writable, so Arrangement automation is written into
+# the Arrangement clips covering the requested span; tracks without clips
+# (group tracks, audio tracks monitoring an input) can't be automated this way.
+
+def _automation_target(
+    target_type: str, device_index: int, parameter_index: int, mixer_name: str, send_index: int
+) -> Dict[str, Any]:
+    if target_type == "mixer":
+        return {"type": "mixer", "name": mixer_name, "send_index": send_index}
+    return {"type": "device", "device_index": device_index, "parameter_index": parameter_index}
+
+
+
+
+@mcp.tool()
+@telemetry_tool("get_clip_automation")
+@trajectory_tool("get_clip_automation", modifying=False)
+def get_clip_automation(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    clip_view: str = "session",
+    target_type: str = "device",
+    device_index: int = 0,
+    parameter_index: int = 0,
+    mixer_name: str = "volume",
+    send_index: int = 0,
+    resolution: float = 1.0,
+    user_prompt: str = "",
+) -> str:
+    """
+    Read a clip's automation envelope for one parameter, sampled every `resolution` beats.
+
+    Parameters:
+    - track_index: Track that owns the clip
+    - clip_index: Session slot index (clip_view="session") or index into the track's
+      Arrangement clips as listed by get_arrangement_clips (clip_view="arrangement")
+    - clip_view: "session" or "arrangement"
+    - resolution: Sampling step in beats (capped to at most 512 samples)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+
+    Target (what to automate):
+    - target_type: "device" (a device parameter) or "mixer" (track mixer)
+    - device_index, parameter_index: for "device"; discover them with get_device_parameters
+    - mixer_name: for "mixer": "volume", "panning" or "send"
+    - send_index: for mixer_name "send"
+    Values are in the parameter's own units (the same min..max that
+    get_device_parameters reports), and are clamped to that range.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("get_clip_automation", {
+            "track_index": track_index,
+            "clip_view": clip_view,
+            "clip_index": clip_index,
+            "target": _automation_target(target_type, device_index, parameter_index, mixer_name, send_index),
+            "resolution": resolution,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error reading clip automation: {str(e)}")
+        return f"Error reading clip automation: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_clip_automation")
+@trajectory_tool("set_clip_automation")
+def set_clip_automation(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    points: List[Dict[str, Any]],
+    clip_view: str = "session",
+    target_type: str = "device",
+    device_index: int = 0,
+    parameter_index: int = 0,
+    mixer_name: str = "volume",
+    send_index: int = 0,
+    resolution: float = 0.125,
+    clear_existing: bool = True,
+    user_prompt: str = "",
+) -> str:
+    """
+    Write an automation curve into one clip's envelope.
+
+    points: [{"time": beats, "value": v, "step": false}, ...] with times in clip-local
+    beats (0 = clip start, same timeline as note start_time). Between points the value
+    ramps linearly; "step": true holds the point's value until the next point (a jump).
+    Before the first / after the last point the end values are held, so one point
+    writes a flat line. Ramps are written as steps `resolution` beats wide.
+
+    Parameters:
+    - track_index, clip_index, clip_view: which clip (see get_clip_automation)
+    - points: The curve (see above)
+    - resolution: Step width for ramps in beats (default 1/32 note = 0.125)
+    - clear_existing: Replace the parameter's existing envelope in this clip (default True)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+
+    Target (what to automate):
+    - target_type: "device" (a device parameter) or "mixer" (track mixer)
+    - device_index, parameter_index: for "device"; discover them with get_device_parameters
+    - mixer_name: for "mixer": "volume", "panning" or "send"
+    - send_index: for mixer_name "send"
+    Values are in the parameter's own units (the same min..max that
+    get_device_parameters reports), and are clamped to that range.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_clip_automation", {
+            "track_index": track_index,
+            "clip_view": clip_view,
+            "clip_index": clip_index,
+            "target": _automation_target(target_type, device_index, parameter_index, mixer_name, send_index),
+            "points": points,
+            "resolution": resolution,
+            "clear_existing": clear_existing,
+        })
+        return (
+            f"Wrote {result.get('device')}: {result.get('parameter')} automation into "
+            f"'{result.get('clip_name')}' ({result.get('points')} points, "
+            f"{result.get('steps_written')} steps)"
+        )
+    except Exception as e:
+        logger.error(f"Error writing clip automation: {str(e)}")
+        return f"Error writing clip automation: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("clear_clip_automation")
+@trajectory_tool("clear_clip_automation")
+def clear_clip_automation(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    clip_view: str = "session",
+    all_parameters: bool = False,
+    target_type: str = "device",
+    device_index: int = 0,
+    parameter_index: int = 0,
+    mixer_name: str = "volume",
+    send_index: int = 0,
+    user_prompt: str = "",
+) -> str:
+    """
+    Remove automation from one clip: a single parameter's envelope, or every envelope
+    when all_parameters is True.
+
+    Parameters:
+    - track_index, clip_index, clip_view: which clip (see get_clip_automation)
+    - all_parameters: Clear every envelope in the clip instead of one target
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+
+    Target (what to automate):
+    - target_type: "device" (a device parameter) or "mixer" (track mixer)
+    - device_index, parameter_index: for "device"; discover them with get_device_parameters
+    - mixer_name: for "mixer": "volume", "panning" or "send"
+    - send_index: for mixer_name "send"
+    Values are in the parameter's own units (the same min..max that
+    get_device_parameters reports), and are clamped to that range.
+    """
+    try:
+        ableton = get_ableton_connection()
+        target = None if all_parameters else _automation_target(
+            target_type, device_index, parameter_index, mixer_name, send_index)
+        result = ableton.send_command("clear_clip_automation", {
+            "track_index": track_index,
+            "clip_view": clip_view,
+            "clip_index": clip_index,
+            "target": target,
+        })
+        return f"Cleared {result.get('cleared')} in '{result.get('clip_name')}'"
+    except Exception as e:
+        logger.error(f"Error clearing clip automation: {str(e)}")
+        return f"Error clearing clip automation: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_arrangement_automation")
+@trajectory_tool("set_arrangement_automation")
+def set_arrangement_automation(
+    ctx: Context,
+    track_index: int,
+    points: List[Dict[str, Any]],
+    target_type: str = "device",
+    device_index: int = 0,
+    parameter_index: int = 0,
+    mixer_name: str = "volume",
+    send_index: int = 0,
+    resolution: float = 0.125,
+    clear_existing: bool = True,
+    user_prompt: str = "",
+) -> str:
+    """
+    Automate a parameter across the Arrangement timeline (filter sweeps, builds, fades).
+
+    points: [{"time": beats, "value": v, "step": false}, ...] with times in absolute
+    Arrangement beats (0 = bar 1; bar N starts at (N-1)*4 in 4/4). The curve is written
+    into every Arrangement clip on the track that overlaps the span from the first to
+    the last point; inside each touched clip the curve holds its end values outside
+    that span. Between points the value ramps linearly; "step": true makes a jump.
+
+    Limits: only tracks with Arrangement clips covering the span can be automated
+    (Live's API can't write track-level lanes). A clip that loops inside the
+    Arrangement repeats its envelope each loop; the result flags those clips.
+
+    Parameters:
+    - track_index: Track to automate
+    - points: The curve (see above)
+    - resolution: Step width for ramps in beats (default 0.125)
+    - clear_existing: Replace this parameter's envelope in each touched clip (default True)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+
+    Target (what to automate):
+    - target_type: "device" (a device parameter) or "mixer" (track mixer)
+    - device_index, parameter_index: for "device"; discover them with get_device_parameters
+    - mixer_name: for "mixer": "volume", "panning" or "send"
+    - send_index: for mixer_name "send"
+    Values are in the parameter's own units (the same min..max that
+    get_device_parameters reports), and are clamped to that range.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("set_arrangement_automation", {
+            "track_index": track_index,
+            "target": _automation_target(target_type, device_index, parameter_index, mixer_name, send_index),
+            "points": points,
+            "resolution": resolution,
+            "clear_existing": clear_existing,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error writing arrangement automation: {str(e)}")
+        return f"Error writing arrangement automation: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("clear_arrangement_automation")
+@trajectory_tool("clear_arrangement_automation")
+def clear_arrangement_automation(
+    ctx: Context,
+    track_index: int,
+    start_time: float = 0.0,
+    end_time: float = -1.0,
+    all_parameters: bool = False,
+    target_type: str = "device",
+    device_index: int = 0,
+    parameter_index: int = 0,
+    mixer_name: str = "volume",
+    send_index: int = 0,
+    user_prompt: str = "",
+) -> str:
+    """
+    Remove automation from the Arrangement clips on a track that overlap
+    [start_time, end_time) in beats (end_time < 0 means to the end of the song).
+
+    Parameters:
+    - track_index: Track to clear
+    - start_time, end_time: Arrangement beat range
+    - all_parameters: Clear every envelope in those clips instead of one target
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+
+    Target (what to automate):
+    - target_type: "device" (a device parameter) or "mixer" (track mixer)
+    - device_index, parameter_index: for "device"; discover them with get_device_parameters
+    - mixer_name: for "mixer": "volume", "panning" or "send"
+    - send_index: for mixer_name "send"
+    Values are in the parameter's own units (the same min..max that
+    get_device_parameters reports), and are clamped to that range.
+    """
+    try:
+        ableton = get_ableton_connection()
+        target = None if all_parameters else _automation_target(
+            target_type, device_index, parameter_index, mixer_name, send_index)
+        result = ableton.send_command("clear_arrangement_automation", {
+            "track_index": track_index,
+            "target": target,
+            "start_time": start_time,
+            "end_time": None if end_time < 0 else end_time,
+        })
+        return (
+            f"Cleared {result.get('cleared')} in {len(result.get('clips', []))} "
+            f"Arrangement clip(s) on track {track_index}"
+        )
+    except Exception as e:
+        logger.error(f"Error clearing arrangement automation: {str(e)}")
+        return f"Error clearing arrangement automation: {str(e)}"
 
 
 @mcp.tool()

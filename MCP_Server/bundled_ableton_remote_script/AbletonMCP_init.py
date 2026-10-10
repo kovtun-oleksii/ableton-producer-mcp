@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.1"
+SCRIPT_VERSION = "1.8.0"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -57,7 +57,73 @@ SCRIPT_CAPABILITIES = [
     "create_locator",
     "delete_clip",
     "clear_notes_from_clip",
+    "get_clip_automation",
+    "set_clip_automation",
+    "clear_clip_automation",
+    "set_arrangement_automation",
+    "clear_arrangement_automation",
 ]
+
+
+# ── Automation helpers (pure; no Live API, unit-tested outside Live) ─────────
+
+def _automation_points(points):
+    """Validate [{time, value, step?}] and return sorted (time, value, step) tuples."""
+    out = []
+    for p in points or []:
+        if not isinstance(p, dict) or "time" not in p or "value" not in p:
+            raise ValueError("Each automation point needs 'time' and 'value'")
+        out.append((float(p["time"]), float(p["value"]), bool(p.get("step", False))))
+    if not out:
+        raise ValueError("At least one automation point is required")
+    out.sort(key=lambda p: p[0])
+    return out
+
+
+def _automation_value_at(points, t):
+    """Curve through sorted points, holding the end values outside them.
+
+    Segments ramp linearly; a point with step=True holds its value until the
+    next point instead of ramping towards it.
+    """
+    if t <= points[0][0]:
+        return points[0][1]
+    for (t0, v0, step0), (t1, v1, _) in zip(points, points[1:]):
+        if t < t1:
+            if step0 or t1 <= t0:
+                return v0
+            return v0 + (v1 - v0) * (t - t0) / (t1 - t0)
+    return points[-1][1]
+
+
+def _automation_segments(points, start, end, resolution, lo, hi):
+    """Turn a curve into constant (time, duration, value) steps covering [start, end).
+
+    Live envelopes only take steps (AutomationEnvelope.insert_step), so ramps
+    are approximated by steps `resolution` beats wide. Point times are also
+    step boundaries so jumps land exactly; adjacent equal steps are merged.
+    """
+    resolution = max(float(resolution), 1.0 / 64)
+    bounds = set()
+    t = float(start)
+    while t < end - 1e-9:
+        bounds.add(round(t, 9))
+        t += resolution
+    for pt, _, _ in points:
+        if start < pt < end:
+            bounds.add(round(pt, 9))
+    bounds = sorted(bounds) + [float(end)]
+    tolerance = 1e-9 * max(1.0, abs(hi - lo))
+    segments = []
+    for b0, b1 in zip(bounds, bounds[1:]):
+        value = min(hi, max(lo, _automation_value_at(points, b0)))
+        if segments and abs(segments[-1][2] - value) <= tolerance:
+            t_prev, dur_prev, v_prev = segments[-1]
+            segments[-1] = (t_prev, dur_prev + (b1 - b0), v_prev)
+        else:
+            segments.append((b0, b1 - b0, value))
+    return segments
+
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -300,7 +366,11 @@ class AbletonMCP(ControlSurface):
                                  "switch_to_arrangement_view", "set_current_song_time",
                                  "duplicate_session_clip_to_arrangement",
                                  "map_rack_magnitude", "inspect_rack",
-                                 "create_locator"]:
+                                 "create_locator",
+                                 # Clip envelopes (automation)
+                                 "set_clip_automation", "clear_clip_automation",
+                                 "set_arrangement_automation",
+                                 "clear_arrangement_automation"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -400,6 +470,35 @@ class AbletonMCP(ControlSurface):
                             name = params.get("name", "")
                             time_val = params.get("time", 0.0)
                             result = self._create_locator(name, time_val)
+                        # ── Automation (clip envelopes) ────────────────────────────
+                        elif command_type == "set_clip_automation":
+                            result = self._set_clip_automation(
+                                params.get("track_index", 0),
+                                params.get("clip_view", "session"),
+                                params.get("clip_index", 0),
+                                params.get("target", {}),
+                                params.get("points", []),
+                                params.get("resolution", 0.125),
+                                params.get("clear_existing", True))
+                        elif command_type == "clear_clip_automation":
+                            result = self._clear_clip_automation(
+                                params.get("track_index", 0),
+                                params.get("clip_view", "session"),
+                                params.get("clip_index", 0),
+                                params.get("target"))
+                        elif command_type == "set_arrangement_automation":
+                            result = self._set_arrangement_automation(
+                                params.get("track_index", 0),
+                                params.get("target", {}),
+                                params.get("points", []),
+                                params.get("resolution", 0.125),
+                                params.get("clear_existing", True))
+                        elif command_type == "clear_arrangement_automation":
+                            result = self._clear_arrangement_automation(
+                                params.get("track_index", 0),
+                                params.get("target"),
+                                params.get("start_time", 0.0),
+                                params.get("end_time"))
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -417,7 +516,12 @@ class AbletonMCP(ControlSurface):
                 
                 # create_audio_clip decodes/imports the file on the main
                 # thread and needs more than the default headroom.
-                long_running_commands = {"create_audio_clip": 60.0}
+                long_running_commands = {
+                    "create_audio_clip": 60.0,
+                    # One envelope write per arrangement clip in range.
+                    "set_arrangement_automation": 60.0,
+                    "clear_arrangement_automation": 30.0,
+                }
                 queue_timeout = long_running_commands.get(command_type, 10.0)
                 try:
                     task_response = response_queue.get(timeout=queue_timeout)
@@ -451,6 +555,13 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_arrangement_clips":
                 track_index = params.get("track_index", 0)
                 response["result"] = self._get_arrangement_clips(track_index)
+            elif command_type == "get_clip_automation":
+                response["result"] = self._get_clip_automation(
+                    params.get("track_index", 0),
+                    params.get("clip_view", "session"),
+                    params.get("clip_index", 0),
+                    params.get("target", {}),
+                    params.get("resolution", 1.0))
             # Dataset / state-snapshot reads
             elif command_type == "get_clip_notes":
                 track_index = params.get("track_index", 0)
@@ -1269,6 +1380,228 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error duplicating clip to arrangement: " + str(e))
             raise
 
+    # ── Automation (clip envelopes) ─────────────────────────────────────────
+    #
+    # Live's API can only write automation that lives inside a clip
+    # (Clip.automation_envelope / create_automation_envelope). Track-level
+    # Arrangement lanes are not writable, so "arrangement automation" here
+    # means writing envelopes into the Arrangement clips that cover a range.
+
+    def _automation_track(self, track_index):
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        return self._song.tracks[track_index]
+
+    def _automation_parameter(self, track, target):
+        """Resolve a target spec to a DeviceParameter on ``track``.
+
+        target = {"type": "device", "device_index": int, "parameter_index": int}
+               | {"type": "mixer", "name": "volume" | "panning" | "send", "send_index": int}
+        """
+        if not isinstance(target, dict):
+            raise ValueError("target must be an object")
+        kind = target.get("type", "device")
+        if kind == "device":
+            device_index = int(target.get("device_index", 0))
+            parameter_index = int(target.get("parameter_index", 0))
+            if device_index < 0 or device_index >= len(track.devices):
+                raise IndexError("Device index out of range")
+            device = track.devices[device_index]
+            if parameter_index < 0 or parameter_index >= len(device.parameters):
+                raise IndexError("Parameter index out of range")
+            return device.parameters[parameter_index], device.name
+        if kind == "mixer":
+            mixer = track.mixer_device
+            name = str(target.get("name", "volume")).lower()
+            if name == "volume":
+                return mixer.volume, "Mixer"
+            if name in ("panning", "pan"):
+                return mixer.panning, "Mixer"
+            if name == "send":
+                send_index = int(target.get("send_index", 0))
+                if send_index < 0 or send_index >= len(mixer.sends):
+                    raise IndexError("Send index out of range")
+                return mixer.sends[send_index], "Mixer"
+            raise ValueError("Unknown mixer target: " + name)
+        raise ValueError("Unknown target type: " + str(kind))
+
+    def _automation_clip(self, track, clip_view, clip_index):
+        """clip_view 'session' indexes clip slots; 'arrangement' indexes
+        track.arrangement_clips in the order get_arrangement_clips returns."""
+        if clip_view == "session":
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip slot index out of range")
+            slot = track.clip_slots[clip_index]
+            if not slot.has_clip:
+                raise Exception("No clip in slot " + str(clip_index))
+            return slot.clip
+        if clip_view == "arrangement":
+            clips = list(track.arrangement_clips)
+            if clip_index < 0 or clip_index >= len(clips):
+                raise IndexError("Arrangement clip index out of range")
+            return clips[clip_index]
+        raise ValueError("clip_view must be 'session' or 'arrangement'")
+
+    @staticmethod
+    def _clip_time_range(clip):
+        """Clip-local beat range an envelope spans (what plays once through)."""
+        if getattr(clip, "looping", False):
+            return float(clip.loop_start), float(clip.loop_end)
+        return float(clip.start_marker), float(clip.end_marker)
+
+    def _write_clip_envelope(self, clip, param, points, start, end, resolution, clear_existing):
+        if clear_existing:
+            try:
+                clip.clear_envelope(param)
+            except Exception:
+                pass
+        envelope = clip.automation_envelope(param)
+        if envelope is None:
+            envelope = clip.create_automation_envelope(param)
+        if envelope is None:
+            raise Exception(
+                "Live did not create an envelope for '" + str(param.name) +
+                "' in clip '" + str(clip.name) + "'")
+        segments = _automation_segments(
+            points, start, end, resolution, float(param.min), float(param.max))
+        for t, duration, value in segments:
+            envelope.insert_step(t, duration, value)
+        return len(segments)
+
+    def _get_clip_automation(self, track_index, clip_view, clip_index, target, resolution):
+        track = self._automation_track(track_index)
+        param, device_name = self._automation_parameter(track, target)
+        clip = self._automation_clip(track, clip_view, clip_index)
+        start, end = self._clip_time_range(clip)
+        envelope = clip.automation_envelope(param)
+        result = {
+            "track_index": track_index,
+            "clip_name": clip.name,
+            "device": device_name,
+            "parameter": param.name,
+            "min": float(param.min),
+            "max": float(param.max),
+            "clip_start": start,
+            "clip_end": end,
+            "has_envelope": envelope is not None,
+            "samples": [],
+        }
+        if envelope is not None:
+            # Cap the sample count so a long clip can't blow up the reply.
+            step = max(float(resolution), (end - start) / 512.0, 1.0 / 64)
+            t = start
+            while t < end - 1e-9:
+                result["samples"].append(
+                    {"time": round(t, 6), "value": float(envelope.value_at_time(t))})
+                t += step
+        return result
+
+    def _set_clip_automation(self, track_index, clip_view, clip_index, target, points,
+                             resolution, clear_existing):
+        track = self._automation_track(track_index)
+        param, device_name = self._automation_parameter(track, target)
+        clip = self._automation_clip(track, clip_view, clip_index)
+        curve = _automation_points(points)
+        start, end = self._clip_time_range(clip)
+        steps = self._write_clip_envelope(
+            clip, param, curve, start, end, resolution, clear_existing)
+        return {
+            "track_index": track_index,
+            "clip_name": clip.name,
+            "device": device_name,
+            "parameter": param.name,
+            "clip_start": start,
+            "clip_end": end,
+            "points": len(curve),
+            "steps_written": steps,
+        }
+
+    def _clear_clip_automation(self, track_index, clip_view, clip_index, target):
+        track = self._automation_track(track_index)
+        clip = self._automation_clip(track, clip_view, clip_index)
+        if target:
+            param, device_name = self._automation_parameter(track, target)
+            clip.clear_envelope(param)
+            return {"clip_name": clip.name, "cleared": device_name + ": " + param.name}
+        clip.clear_all_envelopes()
+        return {"clip_name": clip.name, "cleared": "all envelopes"}
+
+    def _arrangement_clips_in_range(self, track, range_start, range_end):
+        clips = []
+        for index, clip in enumerate(track.arrangement_clips):
+            if clip.end_time > range_start and clip.start_time < range_end:
+                clips.append((index, clip))
+        return clips
+
+    def _set_arrangement_automation(self, track_index, target, points, resolution,
+                                    clear_existing):
+        """Write a curve given in absolute Arrangement beats into every
+        Arrangement clip on the track that overlaps the curve's time span."""
+        track = self._automation_track(track_index)
+        param, device_name = self._automation_parameter(track, target)
+        curve = _automation_points(points)
+        range_start, range_end = curve[0][0], curve[-1][0]
+        if range_end <= range_start:
+            range_end = range_start + 1e-6
+        touched = self._arrangement_clips_in_range(track, range_start, range_end)
+        if not touched:
+            raise Exception(
+                "No Arrangement clips on track '" + str(track.name) + "' between beats " +
+                str(range_start) + " and " + str(range_end) +
+                ". Clip envelopes need a clip to live in; tracks without clips "
+                "(e.g. audio tracks monitoring an input, group tracks) can't be "
+                "automated this way.")
+        written = []
+        for index, clip in touched:
+            local_start, local_end = self._clip_time_range(clip)
+            # Arrangement position clip.start_time plays clip time start_marker.
+            offset = float(clip.start_marker) - float(clip.start_time)
+            local_curve = [(t + offset, v, step) for t, v, step in curve]
+            arrangement_span = float(clip.end_time) - float(clip.start_time)
+            loop_repeats = (getattr(clip, "looping", False) and
+                            arrangement_span > (local_end - local_start) + 1e-6)
+            steps = self._write_clip_envelope(
+                clip, param, local_curve, local_start, local_end, resolution, clear_existing)
+            entry = {
+                "clip_index": index,
+                "clip_name": clip.name,
+                "start_time": float(clip.start_time),
+                "end_time": float(clip.end_time),
+                "steps_written": steps,
+            }
+            if loop_repeats:
+                entry["warning"] = ("clip loops inside the Arrangement; its envelope "
+                                    "repeats every loop instead of following the curve")
+            written.append(entry)
+        return {
+            "track_index": track_index,
+            "track_name": track.name,
+            "device": device_name,
+            "parameter": param.name,
+            "range_start": range_start,
+            "range_end": range_end,
+            "clips": written,
+        }
+
+    def _clear_arrangement_automation(self, track_index, target, start_time, end_time):
+        track = self._automation_track(track_index)
+        param = None
+        label = "all envelopes"
+        if target:
+            param, device_name = self._automation_parameter(track, target)
+            label = device_name + ": " + param.name
+        range_start = float(start_time or 0.0)
+        range_end = float(end_time) if end_time is not None else float("inf")
+        cleared = []
+        for index, clip in self._arrangement_clips_in_range(track, range_start, range_end):
+            if param is not None:
+                clip.clear_envelope(param)
+            else:
+                clip.clear_all_envelopes()
+            cleared.append({"clip_index": index, "clip_name": clip.name,
+                            "start_time": float(clip.start_time)})
+        return {"track_index": track_index, "cleared": label, "clips": cleared}
+
     def _create_locator(self, name, time_val):
         """Create (or rename) a named locator at the given beat position.
 
@@ -1292,13 +1625,23 @@ class AbletonMCP(ControlSurface):
             original_time = song.current_song_time
 
             if existing is None:
-                # Move playhead, toggle to create, then locate the new cue
+                # Move playhead, toggle to create, then locate the new cue.
+                # While the transport runs the playhead keeps moving, so the
+                # cue can land slightly off target: find it as the one cue
+                # time that wasn't there before rather than by exact time.
+                times_before = [cue.time for cue in song.cue_points]
                 song.current_song_time = target_time
                 song.set_or_delete_cue()
                 for cue in song.cue_points:
                     if abs(cue.time - target_time) < tolerance:
                         existing = cue
                         break
+                if existing is None:
+                    for cue in song.cue_points:
+                        is_new = all(abs(cue.time - t) >= tolerance for t in times_before)
+                        if is_new and abs(cue.time - target_time) < 4.0:
+                            existing = cue
+                            break
                 # Restore playhead
                 try:
                     song.current_song_time = original_time
