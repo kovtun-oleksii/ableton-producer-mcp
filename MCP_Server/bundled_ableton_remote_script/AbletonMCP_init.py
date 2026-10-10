@@ -469,6 +469,59 @@ class AbletonMCP(ControlSurface):
                 )
             elif command_type == "drain_passive_events":
                 response["result"] = self._drain_passive_events()
+            elif command_type == "measure_peak":
+                response["result"] = self._measure_peak(
+                    params.get("track_index", -1),
+                    params.get("duration", 4.0),
+                )
+            elif command_type in ("set_track_volume_db", "set_clip_color",
+                                  "set_chain_volume_db", "set_track_mute"):
+                response_queue = queue.Queue()
+
+                def main_thread_task():
+                    try:
+                        if command_type == "set_clip_color":
+                            result = self._set_clip_color(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                int(params.get("color", 0)),
+                            )
+                        elif command_type == "set_chain_volume_db":
+                            result = self._set_chain_volume_db(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                params.get("chain_index", 0),
+                                float(params.get("db", 0.0)),
+                            )
+                        elif command_type == "set_track_mute":
+                            track = self._song.tracks[params.get("track_index", 0)]
+                            track.mute = bool(params.get("mute", True))
+                            result = {"track": track.name, "mute": bool(track.mute)}
+                        else:
+                            result = self._set_track_volume_db(
+                                params.get("track_index", -1),
+                                float(params.get("db", 0.0)),
+                            )
+                        response_queue.put({"status": "success", "result": result})
+                    except Exception as e:
+                        self.log_message("Error in main thread task: " + str(e))
+                        response_queue.put({"status": "error", "message": str(e)})
+
+                try:
+                    self.schedule_message(0, main_thread_task)
+                except AssertionError:
+                    main_thread_task()
+
+                try:
+                    task_response = response_queue.get(timeout=10.0)
+                    if task_response.get("status") == "error":
+                        response["status"] = "error"
+                        response["message"] = task_response.get("message", "Unknown error")
+                    else:
+                        response["result"] = task_response.get("result", {})
+                except queue.Empty:
+                    response["status"] = "error"
+                    response["message"] = "Timeout waiting for operation to complete"
             elif command_type == "set_device_parameter":
                 response_queue = queue.Queue()
 
@@ -513,6 +566,86 @@ class AbletonMCP(ControlSurface):
         return response
     
     # Command implementations
+
+    def _measure_peak(self, track_index, duration):
+        """Sample a track's output meters for `duration` seconds; return the max.
+
+        track_index -1 means the master track. Values are Live's raw meter
+        scale (0..1, not dB): calibrate against a known level before
+        converting.
+        """
+        if track_index == -1:
+            track = self._song.master_track
+        else:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+        duration = max(0.2, min(float(duration), 30.0))
+        # This thread only gets the GIL ~10x/s, too slow to catch a transient
+        # on the momentary meters. output_meter_level holds its peak for 1 s,
+        # so even sparse sampling sees the true per-hit maximum.
+        peak_l = peak_r = peak_hold = 0.0
+        samples = 0
+        deadline = time.time() + duration
+        while time.time() < deadline:
+            try:
+                peak_hold = max(peak_hold, float(track.output_meter_level))
+                peak_l = max(peak_l, float(track.output_meter_left))
+                peak_r = max(peak_r, float(track.output_meter_right))
+                samples += 1
+            except Exception:
+                pass
+            time.sleep(0.01)
+        return {
+            "track": track.name,
+            "samples": samples,
+            "peak_hold": peak_hold,
+            "peak_left": peak_l,
+            "peak_right": peak_r,
+        }
+
+    def _set_clip_color(self, track_index, clip_index, color):
+        """Set a Session clip's colour (0xRRGGBB; Live snaps to its palette)."""
+        clip = self._song.tracks[track_index].clip_slots[clip_index].clip
+        if clip is None:
+            raise Exception("No clip in slot %d" % clip_index)
+        clip.color = color
+        return {"clip": clip.name, "color": int(clip.color)}
+
+    def _set_chain_volume_db(self, track_index, device_index, chain_index, db):
+        """Set a rack chain's (e.g. drum pad's) volume to `db`."""
+        device = self._song.tracks[track_index].devices[device_index]
+        chain = device.chains[chain_index]
+        return self._set_param_db(chain.mixer_device.volume, db, chain.name)
+
+    def _set_track_volume_db(self, track_index, db):
+        """Set a track fader (-1 = master) to `db` by bisecting on Live's display text."""
+        if track_index == -1:
+            track = self._song.master_track
+        else:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+            track = self._song.tracks[track_index]
+        return self._set_param_db(track.mixer_device.volume, db, track.name)
+
+    def _set_param_db(self, param, db, owner_name):
+        """Bisect a dB-displayed mixer parameter until its display reads `db`."""
+        import re
+
+        def to_db(v):
+            m = re.search(r"-?\d+(\.\d+)?", str(param.str_for_value(v)))
+            return float(m.group()) if m else -1000.0
+
+        lo, hi = float(param.min), float(param.max)
+        for _ in range(40):
+            mid = (lo + hi) / 2.0
+            if to_db(mid) < db:
+                lo = mid
+            else:
+                hi = mid
+        param.value = hi
+        return {"track": owner_name, "value": float(param.value),
+                "display": str(param.str_for_value(param.value))}
 
     def _get_script_info(self):
         """Handshake payload for MCP server version / capability checks."""
@@ -1964,6 +2097,13 @@ class AbletonMCP(ControlSurface):
                         }
                         if hasattr(param, "value_string"):
                             entry["value_string"] = str(param.value_string)
+                        # Live's own display text for the value ("-12.0 dB",
+                        # "250 ms") — the only way to read units for
+                        # parameters exposed as normalised 0..1.
+                        try:
+                            entry["display"] = str(param.str_for_value(param.value))
+                        except Exception:
+                            pass
                         if hasattr(param, "automation_state"):
                             try:
                                 entry["automation_state"] = int(param.automation_state)
