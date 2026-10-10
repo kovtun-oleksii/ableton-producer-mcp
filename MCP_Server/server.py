@@ -1314,10 +1314,11 @@ def duplicate_to_arrangement(
 
 # ── Automation (clip envelopes) ───────────────────────────────────────────────
 #
-# Live's API only writes automation that lives inside clips. Track-level
-# Arrangement lanes are not writable, so Arrangement automation is written into
-# the Arrangement clips covering the requested span; tracks without clips
-# (group tracks, audio tracks monitoring an input) can't be automated this way.
+# Live's API only creates envelopes in Session clips. Arrangement automation is
+# produced by rebuilding the Arrangement MIDI clips in range through a Session
+# carrier clip: Live turns the carrier's envelope into track automation when it
+# is duplicated into the Arrangement. Tracks without MIDI clips there (group
+# tracks, audio tracks monitoring an input) can't be automated this way.
 
 def _automation_target(
     target_type: str, device_index: int, parameter_index: int, mixer_name: str, send_index: int
@@ -1511,20 +1512,27 @@ def set_arrangement_automation(
     Automate a parameter across the Arrangement timeline (filter sweeps, builds, fades).
 
     points: [{"time": beats, "value": v, "step": false}, ...] with times in absolute
-    Arrangement beats (0 = bar 1; bar N starts at (N-1)*4 in 4/4). The curve is written
-    into every Arrangement clip on the track that overlaps the span from the first to
-    the last point; inside each touched clip the curve holds its end values outside
-    that span. Between points the value ramps linearly; "step": true makes a jump.
+    Arrangement beats (0 = bar 1; bar N starts at (N-1)*4 in 4/4). Between points the
+    value ramps linearly; "step": true makes a jump.
 
-    Limits: only tracks with Arrangement clips covering the span can be automated
-    (Live's API can't write track-level lanes). A clip that loops inside the
-    Arrangement repeats its envelope each loop; the result flags those clips.
+    Writes real track automation. Live's API can't create envelopes in Arrangement
+    clips, so every MIDI clip on the track overlapping the span from the first to the
+    last point is rebuilt through an empty Session slot (same notes, name, color, plus
+    the curve) and duplicated back onto itself; Live turns the envelope into track
+    automation over that clip's span. Inside a rebuilt clip the curve holds its end
+    values outside the span; the lane outside rebuilt clips is left untouched, so
+    cover every clip where the value should differ from the parameter's current one.
+
+    Limits: the track needs one empty Session slot and MIDI clips covering the span.
+    Audio clips, and clips looped or trimmed inside the Arrangement, are skipped and
+    listed under "skipped". Group tracks and audio tracks monitoring an input can't
+    be automated through the API.
 
     Parameters:
     - track_index: Track to automate
     - points: The curve (see above)
     - resolution: Step width for ramps in beats (default 0.125)
-    - clear_existing: Replace this parameter's envelope in each touched clip (default True)
+    - clear_existing: Kept for compatibility; the lane is always replaced over each rebuilt clip
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
 
     Target (what to automate):
@@ -1556,9 +1564,9 @@ def set_arrangement_automation(
 def clear_arrangement_automation(
     ctx: Context,
     track_index: int,
+    value: float,
     start_time: float = 0.0,
     end_time: float = -1.0,
-    all_parameters: bool = False,
     target_type: str = "device",
     device_index: int = 0,
     parameter_index: int = 0,
@@ -1567,13 +1575,17 @@ def clear_arrangement_automation(
     user_prompt: str = "",
 ) -> str:
     """
-    Remove automation from the Arrangement clips on a track that overlap
-    [start_time, end_time) in beats (end_time < 0 means to the end of the song).
+    Flatten a parameter's Arrangement automation to a constant `value` over
+    [start_time, end_time) in beats (end_time < 0 means to the last Arrangement clip).
+
+    Live's API can't delete track automation, so the span covered by the MIDI clips
+    in range is overwritten with `value` (same mechanism and limits as
+    set_arrangement_automation). To remove a lane completely, delete it in Live.
 
     Parameters:
-    - track_index: Track to clear
+    - track_index: Track to flatten
+    - value: The constant to write (parameter units, e.g. its un-automated setting)
     - start_time, end_time: Arrangement beat range
-    - all_parameters: Clear every envelope in those clips instead of one target
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
 
     Target (what to automate):
@@ -1586,17 +1598,17 @@ def clear_arrangement_automation(
     """
     try:
         ableton = get_ableton_connection()
-        target = None if all_parameters else _automation_target(
-            target_type, device_index, parameter_index, mixer_name, send_index)
         result = ableton.send_command("clear_arrangement_automation", {
             "track_index": track_index,
-            "target": target,
+            "target": _automation_target(target_type, device_index, parameter_index, mixer_name, send_index),
             "start_time": start_time,
             "end_time": None if end_time < 0 else end_time,
+            "value": value,
         })
         return (
-            f"Cleared {result.get('cleared')} in {len(result.get('clips', []))} "
-            f"Arrangement clip(s) on track {track_index}"
+            f"Flattened {result.get('device')}: {result.get('parameter')} to {value} over "
+            f"{len(result.get('clips', []))} Arrangement clip(s) on track {track_index}"
+            + (f"; skipped {len(result['skipped'])}" if result.get("skipped") else "")
         )
     except Exception as e:
         logger.error(f"Error clearing arrangement automation: {str(e)}")

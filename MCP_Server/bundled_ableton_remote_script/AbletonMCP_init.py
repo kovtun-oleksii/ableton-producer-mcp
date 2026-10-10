@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.8.0"
+SCRIPT_VERSION = "1.8.1"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -498,7 +498,8 @@ class AbletonMCP(ControlSurface):
                                 params.get("track_index", 0),
                                 params.get("target"),
                                 params.get("start_time", 0.0),
-                                params.get("end_time"))
+                                params.get("end_time"),
+                                params.get("value"))
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -1489,10 +1490,13 @@ class AbletonMCP(ControlSurface):
         if envelope is not None:
             # Cap the sample count so a long clip can't blow up the reply.
             step = max(float(resolution), (end - start) / 512.0, 1.0 / 64)
+            # value_at_time on a step boundary returns the step before it, so
+            # read a hair inside each step.
+            nudge = 1e-3
             t = start
             while t < end - 1e-9:
                 result["samples"].append(
-                    {"time": round(t, 6), "value": float(envelope.value_at_time(t))})
+                    {"time": round(t, 6), "value": float(envelope.value_at_time(t + nudge))})
                 t += step
         return result
 
@@ -1535,8 +1539,18 @@ class AbletonMCP(ControlSurface):
 
     def _set_arrangement_automation(self, track_index, target, points, resolution,
                                     clear_existing):
-        """Write a curve given in absolute Arrangement beats into every
-        Arrangement clip on the track that overlaps the curve's time span."""
+        """Write a curve in absolute Arrangement beats as real track automation.
+
+        Live refuses to create envelopes in Arrangement clips ("Not a session
+        clip"), but when a Session clip carrying an automation envelope is
+        duplicated into the Arrangement, Live converts the envelope into track
+        automation over that clip's span and leaves the rest of the lane alone.
+        So every MIDI clip overlapping the curve is rebuilt through a spare
+        Session slot (the carrier): same notes, name and color plus the curve's
+        segment, duplicated back onto its own position. The carrier is removed
+        afterwards. clear_existing is implied: the lane is replaced over each
+        rebuilt clip's span.
+        """
         track = self._automation_track(track_index)
         param, device_name = self._automation_parameter(track, target)
         curve = _automation_points(points)
@@ -1548,31 +1562,66 @@ class AbletonMCP(ControlSurface):
             raise Exception(
                 "No Arrangement clips on track '" + str(track.name) + "' between beats " +
                 str(range_start) + " and " + str(range_end) +
-                ". Clip envelopes need a clip to live in; tracks without clips "
-                "(e.g. audio tracks monitoring an input, group tracks) can't be "
-                "automated this way.")
-        written = []
+                ". Automation is carried in by rebuilding the MIDI clips there; tracks "
+                "without clips (group tracks, audio tracks monitoring an input) can't "
+                "be automated through the API.")
+
+        # Snapshot first: rebuilding replaces the clip objects we iterate over.
+        specs, skipped = [], []
         for index, clip in touched:
-            local_start, local_end = self._clip_time_range(clip)
-            # Arrangement position clip.start_time plays clip time start_marker.
-            offset = float(clip.start_marker) - float(clip.start_time)
-            local_curve = [(t + offset, v, step) for t, v, step in curve]
-            arrangement_span = float(clip.end_time) - float(clip.start_time)
-            loop_repeats = (getattr(clip, "looping", False) and
-                            arrangement_span > (local_end - local_start) + 1e-6)
-            steps = self._write_clip_envelope(
-                clip, param, local_curve, local_start, local_end, resolution, clear_existing)
-            entry = {
-                "clip_index": index,
-                "clip_name": clip.name,
-                "start_time": float(clip.start_time),
-                "end_time": float(clip.end_time),
-                "steps_written": steps,
-            }
-            if loop_repeats:
-                entry["warning"] = ("clip loops inside the Arrangement; its envelope "
-                                    "repeats every loop instead of following the curve")
-            written.append(entry)
+            start, end = float(clip.start_time), float(clip.end_time)
+            loop_start, loop_end = self._clip_time_range(clip)
+            if not getattr(clip, "is_midi_clip", False):
+                skipped.append({"start_time": start, "clip_name": clip.name,
+                                "reason": "audio clip (only MIDI clips can be rebuilt)"})
+                continue
+            if abs((end - start) - (loop_end - loop_start)) > 1e-6:
+                skipped.append({"start_time": start, "clip_name": clip.name,
+                                "reason": "clip is looped or trimmed in the Arrangement; "
+                                          "rebuilding would change its length"})
+                continue
+            specs.append({
+                "start": start, "loop_start": loop_start, "loop_end": loop_end,
+                "start_marker": float(clip.start_marker), "name": clip.name,
+                "color": getattr(clip, "color", None), "notes": self._notes_from_clip(clip),
+            })
+        if not specs:
+            raise Exception("No rebuildable MIDI clips in range: " + str(skipped))
+
+        slot = next((s for s in track.clip_slots if not s.has_clip), None)
+        if slot is None:
+            raise Exception("Track '" + str(track.name) + "' needs one empty Session "
+                            "slot to carry the automation")
+        written = []
+        try:
+            for spec in specs:
+                if slot.has_clip:
+                    slot.delete_clip()
+                slot.create_clip(spec["loop_end"] - spec["loop_start"])
+                carrier = slot.clip
+                carrier.name = spec["name"]
+                if spec["color"] is not None:
+                    try:
+                        carrier.color = spec["color"]
+                    except Exception:
+                        pass
+                carrier.set_notes(tuple(
+                    (n["pitch"], n["start_time"] - spec["loop_start"], n["duration"],
+                     n["velocity"], n["mute"])
+                    for n in spec["notes"]))
+                # Arrangement position `start` plays clip time start_marker; the
+                # carrier's own timeline starts at 0.
+                offset = spec["start_marker"] - spec["loop_start"] - spec["start"]
+                local_curve = [(t + offset, v, step) for t, v, step in curve]
+                carrier_start, carrier_end = self._clip_time_range(carrier)
+                steps = self._write_clip_envelope(
+                    carrier, param, local_curve, carrier_start, carrier_end, resolution, True)
+                track.duplicate_clip_to_arrangement(carrier, spec["start"])
+                written.append({"clip_name": spec["name"], "start_time": spec["start"],
+                                "steps_written": steps})
+        finally:
+            if slot.has_clip:
+                slot.delete_clip()
         return {
             "track_index": track_index,
             "track_name": track.name,
@@ -1581,26 +1630,32 @@ class AbletonMCP(ControlSurface):
             "range_start": range_start,
             "range_end": range_end,
             "clips": written,
+            "skipped": skipped,
         }
 
-    def _clear_arrangement_automation(self, track_index, target, start_time, end_time):
+    def _clear_arrangement_automation(self, track_index, target, start_time, end_time, value):
+        """Flatten a parameter's track automation to `value` over a beat range.
+
+        Live's API can't delete track automation, so the span covered by the
+        MIDI clips in range is overwritten with a constant instead.
+        """
+        if not target:
+            raise ValueError("clear_arrangement_automation needs a target parameter")
+        if value is None:
+            raise ValueError("clear_arrangement_automation needs the value to flatten to")
         track = self._automation_track(track_index)
-        param = None
-        label = "all envelopes"
-        if target:
-            param, device_name = self._automation_parameter(track, target)
-            label = device_name + ": " + param.name
         range_start = float(start_time or 0.0)
-        range_end = float(end_time) if end_time is not None else float("inf")
-        cleared = []
-        for index, clip in self._arrangement_clips_in_range(track, range_start, range_end):
-            if param is not None:
-                clip.clear_envelope(param)
-            else:
-                clip.clear_all_envelopes()
-            cleared.append({"clip_index": index, "clip_name": clip.name,
-                            "start_time": float(clip.start_time)})
-        return {"track_index": track_index, "cleared": label, "clips": cleared}
+        if end_time is None:
+            clips = list(track.arrangement_clips)
+            range_end = max([float(c.end_time) for c in clips] or [range_start + 1.0])
+        else:
+            range_end = float(end_time)
+        result = self._set_arrangement_automation(
+            track_index, target,
+            [{"time": range_start, "value": value}, {"time": range_end, "value": value}],
+            1.0, True)
+        result["flattened_to"] = float(value)
+        return result
 
     def _create_locator(self, name, time_val):
         """Create (or rename) a named locator at the given beat position.
