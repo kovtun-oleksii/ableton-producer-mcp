@@ -530,7 +530,7 @@ def get_device_parameters(
     Read all parameters for a device on a track (name, value, min, max).
 
     Parameters:
-    - track_index: Track that owns the device
+    - track_index: Track that owns the device (-1 = master track)
     - device_index: Index into the track's device chain
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
@@ -563,7 +563,7 @@ def set_device_parameter(
     Use get_device_parameters first to discover parameter indices and ranges.
 
     Parameters:
-    - track_index: Track that owns the device
+    - track_index: Track that owns the device (-1 = master track)
     - device_index: Index into the track's device chain
     - parameter_index: Index into device.parameters
     - value: New parameter value (Live parameter units)
@@ -901,7 +901,7 @@ def load_instrument_or_effect(ctx: Context, track_index: int, uri: str, user_pro
     Load an instrument or effect onto a track using its URI.
 
     Parameters:
-    - track_index: The index of the track to load the instrument on
+    - track_index: The index of the track to load the instrument on (-1 = master track, for audio effects)
     - uri: The URI of the instrument or effect to load (e.g., 'query:Synths#Instrument%20Rack:Bass:FileId_5116')
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """

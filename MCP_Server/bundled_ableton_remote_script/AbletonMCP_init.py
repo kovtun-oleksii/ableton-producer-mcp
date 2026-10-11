@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.8.1"
+SCRIPT_VERSION = "1.8.2"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -1822,12 +1822,9 @@ class AbletonMCP(ControlSurface):
         return self._load_browser_item(track_index, uri)
 
     def _load_browser_item(self, track_index, item_uri):
-        """Load a browser item onto a track by its URI"""
+        """Load a browser item onto a track by its URI (-1 = master track)"""
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            
-            track = self._song.tracks[track_index]
+            track = self._track_or_master(track_index)
             
             # Access the application's browser instance instead of creating a new one
             app = self.application()
@@ -2736,11 +2733,17 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting clip notes: " + str(e))
             raise
 
+    def _track_or_master(self, track_index):
+        """Track by index; -1 addresses the master track (devices on the master bus)."""
+        if track_index == -1:
+            return self._song.master_track
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        return self._song.tracks[track_index]
+
     def _get_device_parameters(self, track_index, device_index):
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            track = self._song.tracks[track_index]
+            track = self._track_or_master(track_index)
             if device_index < 0 or device_index >= len(track.devices):
                 raise IndexError("Device index out of range")
             device = track.devices[device_index]
@@ -2830,9 +2833,7 @@ class AbletonMCP(ControlSurface):
 
     def _set_device_parameter(self, track_index, device_index, parameter_index, value):
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            track = self._song.tracks[track_index]
+            track = self._track_or_master(track_index)
             if device_index < 0 or device_index >= len(track.devices):
                 raise IndexError("Device index out of range")
             device = track.devices[device_index]
