@@ -18,7 +18,7 @@ where plan.json is a list of jobs:
      "target": {"type": "device", "device_index": 1, "parameter_index": 1},
      "points": [{"time": 32, "value": 0.45}, ...],      # absolute Arrangement beats
      "blocks": [32, 48, 64],                               # start beats of blocks to rewrite
-     "fallback_source_slot": 2}                            # for blocks whose name matches no Session clip
+     "fallback_source_slot": 2}                            # optional; otherwise such blocks reuse their own notes
 Several parameters in the same blocks go in one job as
     "targets": [{"target": {...}, "points": [...]}, ...]
 instead of "target"/"points": rebuilding a block replaces the clip, so curves
@@ -50,6 +50,13 @@ def _notes(track_index, slot):
     return [{k: n[k] for k in ("pitch", "start_time", "duration", "velocity", "mute")} for n in notes]
 
 
+def _arrangement_notes(track_index, block_start):
+    snap = _ok(call("get_session_snapshot", {"include_notes": True, "include_params": False}), "get_session_snapshot")
+    clips = snap["tracks"][track_index]["arrangement_clips"]
+    clip = next(c for c in clips if abs(c["start_time"] - block_start) < 1e-6)
+    return [{k: n[k] for k in ("pitch", "start_time", "duration", "velocity", "mute")} for n in clip.get("notes", [])]
+
+
 def automate_blocks(job):
     track = job["track_index"]
     carrier = job["carrier_slot"]
@@ -66,9 +73,14 @@ def automate_blocks(job):
             raise RuntimeError("no Arrangement clip starts at beat %s on track %d" % (block_start, track))
         source = sources.get(block["name"], job.get("fallback_source_slot"))
         if source is None:
-            raise RuntimeError("can't find the Session clip block '%s' came from" % block["name"])
-        # Unnamed blocks (e.g. left by an earlier carrier) take their source's name.
-        name = block["name"] or next(n for n, s in sources.items() if s == source)
+            # No Session clip of that name (edited or one-off blocks): copy the
+            # Arrangement clip's own notes instead.
+            source = ("arrangement", block_start)
+            name = block["name"]
+            note_cache[source] = _arrangement_notes(track, block_start)
+        else:
+            # Unnamed blocks (e.g. left by an earlier carrier) take their source's name.
+            name = block["name"] or next(n for n, s in sources.items() if s == source)
         if source not in note_cache:
             note_cache[source] = _notes(track, source)
 
@@ -77,7 +89,8 @@ def automate_blocks(job):
             _ok(call("delete_clip", {"track_index": track, "clip_index": carrier}), "delete carrier")
         _ok(call("create_clip", {"track_index": track, "clip_index": carrier, "length": block["length"]}), "create carrier")
         _ok(call("set_clip_name", {"track_index": track, "clip_index": carrier, "name": "__automation_carrier__"}), "name carrier")
-        _ok(call("add_notes_to_clip", {"track_index": track, "clip_index": carrier, "notes": note_cache[source]}), "copy notes")
+        if note_cache[source]:
+            _ok(call("add_notes_to_clip", {"track_index": track, "clip_index": carrier, "notes": note_cache[source]}), "copy notes")
         # A rebuilt block replaces the clip, so every curve that should live in
         # it goes into the same carrier ("targets"), not into separate passes.
         curves = job.get("targets") or [{"target": job["target"], "points": job["points"]}]
