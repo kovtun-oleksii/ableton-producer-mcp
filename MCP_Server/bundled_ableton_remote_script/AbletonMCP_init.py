@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.8.2"
+SCRIPT_VERSION = "1.8.3"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -361,7 +361,7 @@ class AbletonMCP(ControlSurface):
                                  "clear_notes_from_clip",
                                  "set_tempo", "fire_clip", "stop_clip",
                                  "start_playback", "stop_playback",
-                                 "load_browser_item", "load_instrument_or_effect",
+                                 "load_browser_item", "load_instrument_or_effect", "insert_device",
                                  # Arrangement view – must run on the main thread
                                  "switch_to_arrangement_view", "set_current_song_time",
                                  "duplicate_session_clip_to_arrangement",
@@ -444,6 +444,9 @@ class AbletonMCP(ControlSurface):
                             track_index = params.get("track_index", 0)
                             item_uri = params.get("item_uri", "")
                             result = self._load_browser_item(track_index, item_uri)
+                        elif command_type == "insert_device":
+                            result = self._insert_device(params.get("track_index", 0), params.get("device_name", ""),
+                                                         params.get("target_index"))
                         # ── Arrangement view commands ──────────────────────────────
                         elif command_type == "switch_to_arrangement_view":
                             result = self._switch_to_arrangement_view()
@@ -1821,10 +1824,37 @@ class AbletonMCP(ControlSurface):
         """
         return self._load_browser_item(track_index, uri)
 
+    def _insert_device(self, track_index, device_name, target_index=None):
+        """Insert a native Live device by name at a chain position (-1 track = master).
+
+        Uses Track.insert_device (Live 12.1.5+), which needs no browser and no
+        track selection, so it also works on the master, where the browser
+        would load into whichever track happens to be selected.
+        """
+        track = self._track_or_master(track_index)
+        if not hasattr(track, "insert_device"):
+            raise RuntimeError("Track.insert_device is not available in this Live version (needs 12.1.5+)")
+        count = len(track.devices)
+        if target_index is None or int(target_index) < 0 or int(target_index) > count:
+            target_index = count
+        track.insert_device(str(device_name), int(target_index))
+        return {"track_name": track.name, "device_name": device_name, "target_index": int(target_index),
+                "devices": [d.name for d in track.devices]}
+
     def _load_browser_item(self, track_index, item_uri):
         """Load a browser item onto a track by its URI (-1 = master track)"""
         try:
             track = self._track_or_master(track_index)
+            if track_index == -1 and hasattr(track, "insert_device"):
+                # The browser loads into the selected track and the master can't
+                # reliably be selected from a script: insert native devices directly.
+                item = self._find_browser_item_by_uri(self.application().browser, item_uri)
+                if not item:
+                    raise ValueError("Browser item with URI '{0}' not found".format(item_uri))
+                name = item.name.rsplit(".", 1)[0] if item.name.endswith((".adv", ".adg")) else item.name
+                info = self._insert_device(-1, name)
+                return {"loaded": True, "item_name": item.name, "track_name": track.name, "uri": item_uri,
+                        "devices_after": info["devices"]}
             
             # Access the application's browser instance instead of creating a new one
             app = self.application()

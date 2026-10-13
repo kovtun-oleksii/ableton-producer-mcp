@@ -135,7 +135,7 @@ class AbletonConnection:
             "delete_clip",
             "clear_notes_from_clip",
             "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
-            "start_playback", "stop_playback", "load_instrument_or_effect",
+            "start_playback", "stop_playback", "load_instrument_or_effect", "insert_device",
             # Arrangement view commands
             "switch_to_arrangement_view", "set_current_song_time",
             "duplicate_session_clip_to_arrangement",
@@ -891,6 +891,33 @@ def set_tempo(ctx: Context, tempo: float, user_prompt: str = "") -> str:
     except Exception as e:
         logger.error(f"Error setting tempo: {str(e)}")
         return f"Error setting tempo: {str(e)}"
+
+
+@mcp.tool()
+def insert_device(ctx: Context, track_index: int, device_name: str, target_index: int = -1, user_prompt: str = "") -> str:
+    """
+    Insert a native Live device (e.g. "Utility", "Saturator", "Limiter", "EQ Eight") by name at a
+    position in a track's device chain, without the browser. Works on the master track, where
+    browser loads land on whichever track is selected. Needs Live 12.1.5+ and Remote Script 1.8.3+.
+
+    Parameters:
+    - track_index: Track to insert into (-1 = master track)
+    - device_name: Native device name as shown in Live's browser
+    - target_index: Chain position (0 = first); -1 appends at the end
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("insert_device", {
+            "track_index": track_index,
+            "device_name": device_name,
+            "target_index": None if target_index < 0 else target_index,
+        })
+        return "Inserted %s on %s at position %s. Chain: %s" % (
+            device_name, result.get("track_name"), result.get("target_index"), ", ".join(result.get("devices", [])))
+    except Exception as e:
+        logger.error(f"Error inserting device: {str(e)}")
+        return f"Error inserting device: {str(e)}"
 
 
 @mcp.tool()
